@@ -1,0 +1,148 @@
+create extension if not exists "uuid-ossp";
+ 
+drop type if exists tipo;
+create type tipo as enum('aluno','escola_adm','global_adm');
+ 
+create table autenticacao_usuarios(
+    id uuid primary key default uuid_generate_v4(),
+    email varchar unique not null,
+    nome varchar not null,
+    senha varchar not null,
+    ativo boolean default true,
+    criado_em timestamp not null default now()
+);
+ 
+create table usuarios(
+    id uuid primary key default uuid_generate_v4(),
+    id_autenticacao uuid not null unique,
+    nome varchar not null,
+    papel varchar not null default 'aluno', -- 'escola_aluno','escola_adm','global_adm'
+   
+    constraint fk_autenticacao
+        foreign key (id_autenticacao)
+        references autenticacao_usuarios(id)
+        on delete cascade
+);
+ 
+create or replace function criar_perfil()
+returns trigger as $$
+begin
+    insert into usuarios(nome, id_autenticacao)
+    values ('',new.id);
+    return new;
+end;
+$$ language plpgsql;
+ 
+create or replace trigger trigger_autenticar_usuario
+after insert on autenticacao_usuarios
+for each row
+execute function criar_perfil();
+
+create table escolas (
+  id uuid primary key not null default uuid_generate_v4(),
+  nome varchar not null,
+  estado varchar(2) not null,
+  cnpj varchar(14) not null unique,
+  id_administrador uuid not null,
+  constraint check_tamanho_cnpj check (length(cnpj) = 14),
+  constraint fk_administrador foreign key (id_administrador) references usuarios(id)
+);
+
+create table escola_aluno (
+  id uuid primary key not null default uuid_generate_v4(),
+  id_aluno uuid not null,
+  id_escola uuid not null,
+  constraint fk_aluno foreign key (id_aluno) references usuarios(id),
+  constraint fk_escola foreign key (id_escola) references escolas(id)
+);
+
+create table questoes (
+    id uuid primary key default uuid_generate_v4(),
+    id_numero bigserial unique not null,
+    enunciado jsonb not null,
+    alternativas jsonb not null,
+    criado_em timestamp default now()
+);
+
+drop type if exists status_sessao;
+create type status_sessao as enum('em andamento', 'concluida');
+ 
+create table sessao_simulado (
+    id uuid primary key not null default uuid_generate_v4(),
+    id_usuario uuid not null,
+    inicio timestamptz not null default now(),
+    termino timestamptz,
+    status status_sessao not null default 'em andamento', -- 'concluida' quando acabar
+    questoes_corretas int default 0,
+    questoes_respondidas int default 0,
+ 
+    constraint fk_usuario
+        foreign key (id_usuario)
+        references usuarios(id),
+ 
+    constraint chk_horario
+        check(
+            termino is null or termino >= inicio
+        )
+);
+ 
+create table respostas (
+    id uuid primary key not null default uuid_generate_v4(),
+    id_sessao uuid not null,
+    id_questao uuid not null,
+    alternativa smallint not null,
+    correta boolean not null default false,
+    hora_clique timestamptz not null default now(),
+ 
+    constraint fk_sessao
+        foreign key (id_sessao)
+        references sessao_simulado(id)
+        on delete cascade,
+ 
+    constraint fk_questao
+        foreign key (id_questao)
+        references questoes(id)
+        on delete cascade,
+ 
+    constraint uq_resposta
+        unique (id_sessao, id_questao)
+);
+
+ALTER TABLE escola_aluno ADD CONSTRAINT uq_escola_aluno UNIQUE (id_escola, id_aluno);
+
+create or replace function fn_verifica_admin()
+returns trigger as $$ 
+declare 
+  v_tipo varchar;
+begin
+  select tipo into v_tipo from usuarios where id = new.id;
+  if v_tipo is distinct from 'escola_adm' then
+    raise exception 'ERRO: o usuario não é um administrador escolar.';
+  end if;
+  return new;
+end;
+$$ language plpgsql;
+
+create or replace trigger trigger_verifica_admin
+before insert on escolas
+for each row
+execute function fn_verifica_admin();
+
+create or replace function fn_atualiza_sessao()
+returns trigger as $$ 
+begin
+    update sessao_simulado 
+    set 
+        questoes_respondidas = questoes_respondidas + 1,
+      
+        questoes_corretas = questoes_corretas + (case when new.correta = true then 1 else 0 end)
+    where id = new.id_sessao;
+
+    return new;
+end;
+$$ language plpgsql;
+
+create or replace trigger trigger_atualiza_sessao
+after insert on respostas
+for each row
+execute function fn_atualiza_sessao();
